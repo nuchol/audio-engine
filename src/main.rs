@@ -1,9 +1,8 @@
 use std::f32::consts::TAU;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use cpal::{Device, Host, SupportedStreamConfig};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 const FREQUENCY: f32 = 440.0;
@@ -37,50 +36,61 @@ impl Waveform {
     }
 }
 
+struct AudioEngine {
+    host: Host,
+    device: Device,
+    config: SupportedStreamConfig,
+}
+
+
+impl AudioEngine {
+    pub fn new() -> Self {
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .expect("no output device available");
+        let config = device
+            .default_output_config()
+            .expect("no default output config");
+
+        assert_eq!(
+            config.sample_format(),
+            cpal::SampleFormat::F32,
+            "only f32 output is supported"
+        );
+
+        Self { host, device, config }
+    }
+
+    pub fn play(&self, freq: f32, amp: f32, duration: u64, wave: Waveform) {
+        let sample_rate = self.config.sample_rate().0 as f32;
+        let channels = self.config.channels() as usize;
+
+        let mut phase = 0.0f32;
+        let stream = self.device
+            .build_output_stream(
+                &self.config.clone().into(),
+                move |data: &mut [f32], _| {
+                    for frame in data.chunks_mut(channels) {
+                        let value = wave.sample(phase) * amp;
+                        frame.fill(value);
+                        phase = (phase + freq / sample_rate) % 1.0;
+                    }
+                },
+                |err| eprintln!("stream error: {err}"),
+                None,
+            )
+            .expect("failed to build output stream");
+
+        stream.play().expect("failed to start stream");
+        thread::sleep(Duration::from_secs(duration));
+    }
+}
+
 fn main() {
-    let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .expect("no output device available");
-    let config = device
-        .default_output_config()
-        .expect("no default output config");
-
-    assert_eq!(
-        config.sample_format(),
-        cpal::SampleFormat::F32,
-        "only f32 output is supported"
-    );
-
-    let sample_rate = config.sample_rate().0 as f32;
-    let channels = config.channels() as usize;
-
-    // Index into WAVEFORMS, shared between main thread and audio callback.
-    let current = Arc::new(AtomicU8::new(0));
-    let current_cb = Arc::clone(&current);
-
-    let mut phase = 0.0f32;
-    let stream = device
-        .build_output_stream(
-            &config.into(),
-            move |data: &mut [f32], _| {
-                let wave = WAVEFORMS[current_cb.load(Ordering::Relaxed) as usize];
-                for frame in data.chunks_mut(channels) {
-                    let value = wave.sample(phase) * AMPLITUDE;
-                    frame.fill(value);
-                    phase = (phase + FREQUENCY / sample_rate) % 1.0;
-                }
-            },
-            |err| eprintln!("stream error: {err}"),
-            None,
-        )
-        .expect("failed to build output stream");
-
-    stream.play().expect("failed to start stream");
-
+    let engine = AudioEngine::new();
     for (i, wave) in WAVEFORMS.iter().enumerate() {
         println!("Playing {wave:?} at {FREQUENCY} Hz");
-        current.store(i as u8, Ordering::Relaxed);
-        thread::sleep(Duration::from_secs(SECONDS_PER_WAVE));
+        engine.play(FREQUENCY, AMPLITUDE, SECONDS_PER_WAVE, *wave);
     }
 }
