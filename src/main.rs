@@ -1,13 +1,9 @@
-use std::f32::consts::TAU;
+use std::{f32::consts::TAU, sync::mpsc};
 use std::thread;
 use std::time::Duration;
+use std::sync::mpsc::Sender;
 
-use cpal::{Device, Host, SupportedStreamConfig};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-
-const FREQUENCY: f32 = 440.0;
-const AMPLITUDE: f32 = 0.2;
-const SECONDS_PER_WAVE: u64 = 2;
 
 #[derive(Clone, Copy, Debug)]
 enum Waveform {
@@ -25,7 +21,6 @@ const WAVEFORMS: [Waveform; 4] = [
 ];
 
 impl Waveform {
-    /// Sample the waveform at phase in [0, 1), output is [-1, 1].
     fn sample(self, phase: f32) -> f32 {
         match self {
             Waveform::Sine => (phase * TAU).sin(),
@@ -36,10 +31,23 @@ impl Waveform {
     }
 }
 
+struct Voice {
+    id: u32,
+    freq: f32,
+    amp: f32,
+    wave: Waveform,
+    phase: f32,
+}
+
+enum AudioCommand {
+    NoteOn { id: u32, freq: f32, amp: f32, wave: Waveform },
+    NoteOff { id: u32 },
+}
+
 struct AudioEngine {
-    host: Host,
-    device: Device,
-    config: SupportedStreamConfig,
+    _stream: cpal::Stream,
+    cmd_sender: Sender<AudioCommand>,
+    next_id: u32,
 }
 
 
@@ -59,22 +67,34 @@ impl AudioEngine {
             "only f32 output is supported"
         );
 
-        Self { host, device, config }
-    }
+        let sample_rate = config.sample_rate().0 as f32;
+        let channels = config.channels() as usize;
 
-    pub fn play(&self, freq: f32, amp: f32, duration: u64, wave: Waveform) {
-        let sample_rate = self.config.sample_rate().0 as f32;
-        let channels = self.config.channels() as usize;
+        let (transmitter, reciever) = mpsc::channel::<AudioCommand>();
 
-        let mut phase = 0.0f32;
-        let stream = self.device
+        let mut voices: Vec<Voice> = Vec::with_capacity(64);
+
+        let stream = device
             .build_output_stream(
-                &self.config.clone().into(),
+                &config.into(),
                 move |data: &mut [f32], _| {
+                    while let Ok(cmd) = reciever.try_recv() {
+                        match cmd {
+                            AudioCommand::NoteOn { id, freq, amp, wave } => {
+                                voices.push(Voice { id, freq, amp, wave, phase: 0.0 })
+                            },
+
+                            AudioCommand::NoteOff { id } => voices.retain(|v| v.id != id),
+                        }
+                    }
+
                     for frame in data.chunks_mut(channels) {
-                        let value = wave.sample(phase) * amp;
-                        frame.fill(value);
-                        phase = (phase + freq / sample_rate) % 1.0;
+                        let mut mix = 0.0;
+                        for v in voices.iter_mut() {
+                            mix += v.wave.sample(v.phase) * v.amp;
+                            v.phase = (v.phase + v.freq / sample_rate) % 1.0;
+                        }
+                        frame.fill(mix.clamp(-1.0, 1.0));
                     }
                 },
                 |err| eprintln!("stream error: {err}"),
@@ -83,14 +103,38 @@ impl AudioEngine {
             .expect("failed to build output stream");
 
         stream.play().expect("failed to start stream");
-        thread::sleep(Duration::from_secs(duration));
+        Self { _stream: stream, cmd_sender: transmitter, next_id: 0 }
+    }
+
+    pub fn note_on(&mut self, freq: f32, amp: f32, wave: Waveform) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.cmd_sender.send(AudioCommand::NoteOn { id, freq, amp, wave }).unwrap();
+        id
+    }
+
+    pub fn note_off(&self, id: u32) {
+        self.cmd_sender.send(AudioCommand::NoteOff { id }).unwrap();
     }
 }
 
 fn main() {
-    let engine = AudioEngine::new();
-    for (i, wave) in WAVEFORMS.iter().enumerate() {
-        println!("Playing {wave:?} at {FREQUENCY} Hz");
-        engine.play(FREQUENCY, AMPLITUDE, SECONDS_PER_WAVE, *wave);
+    let mut engine = AudioEngine::new();
+
+    for wave in WAVEFORMS {
+        println!("Playing C major with {wave:?} wave");
+
+        // C major chord
+        let c = engine.note_on(261.63, 0.2, wave);
+        let e = engine.note_on(329.63, 0.2, wave);
+        let g = engine.note_on(392.00, 0.2, wave);
+
+        thread::sleep(Duration::from_secs(2));
+
+        engine.note_off(c);
+        engine.note_off(e);
+        engine.note_off(g);
+
+        thread::sleep(Duration::from_secs(1));
     }
 }
