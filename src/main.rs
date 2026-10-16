@@ -31,29 +31,26 @@ impl Waveform {
     }
 }
 
+trait Processor {
+    fn sample(&mut self, input: f32) -> f32;
+}
+
+struct Oscillator { freq: f32, wave: Waveform, phase: f32 }
+struct ADSR {}
+struct LowPass {}
+
 struct Note {
     id: u32,
-    freq: f32,
+    osc: Oscillator,
+    amp_env: ADSR,
     amp: f32,
-    wave: Waveform,
-    on: bool,
-    on_time: f32,
-    off_time: f32,
-    phase: f32,
+    // filter: 
 }
 
 impl Note {
-    pub fn new(id: u32, freq: f32, amp: f32, wave: Waveform) -> Self {
-        Self {
-            id,
-            freq,
-            amp,
-            wave,
-            on: true,
-            on_time: 0.0,
-            off_time: 0.0,
-            phase: 0.0,
-        }
+    fn next_sample(&mut self, source: f32) -> f32 {
+        let raw = self.osc.next_sample(source);
+        raw * self.amp_env.next(1.0 / sr) * self.amp
     }
 }
 
@@ -134,11 +131,8 @@ impl AudioEngine {
                     for frame in data.chunks_mut(channels) {
                         let mut mix = 0.0;
                         for n in notes.iter_mut() {
-                            mix += n.wave.sample(n.phase) * n.amp;
+                            mix += n.sample(n.phase);
                             n.phase = (n.phase + (n.freq / sample_rate)) % 1.0;
-
-                            let delta = n.freq / sample_rate;
-                            if n.on { n.on_time +=  delta } else { n.on_time += delta }
                         }
                         frame.fill(mix.clamp(-1.0, 1.0));
                     }
