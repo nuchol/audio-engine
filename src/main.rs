@@ -10,6 +10,7 @@ use crate::adsr::{ Adsr, AdsrSettings };
 use crate::oscillator::{Oscillator, Waveform};
 
 const MAX_TRACKS: usize = 16;
+const BLOCK_SIZE: usize = 16;
 
 pub enum NoteEvent {
     NoteOn { note: u8 },
@@ -19,16 +20,19 @@ pub enum NoteEvent {
 pub trait Instrument: Send {
     fn handle_event(&mut self, event: NoteEvent);
     fn set_param(&mut self, id: u32, value: f32);
-    // fn process(&mut self, out: &mut [f32]);
-    fn process(&mut self) -> f32;
+    fn process(&mut self, out: &mut [f32]);
+}
+
+pub trait Processor {
+    fn process(&mut self, out: &mut [f32]);
 }
 
 struct Params {
     // filter
-    cutoff: f32,            // base cutoff in Hz, e.g. 2000.0
-    resonance: f32,         // 0.0..1.0
-    filter_env_amount: f32, // how far the filter env pushes cutoff (in octaves)
-    lfo_to_cutoff: f32,     // how far the LFO pushes cutoff
+    cutoff: f32,
+    resonance: f32,
+    filter_env_amount: f32,
+    lfo_to_cutoff: f32,
 
     // envelopes (settings only)
     amp_env: AdsrSettings,
@@ -91,8 +95,8 @@ impl Synth {
                 mix += v.next_sample(0.0, &self.params, self.sample_rate);
             }
         }
-        // mix * self.params.master_gain
-        mix
+
+        mix * self.params.master_gain
     }
 
     fn note_on(&mut self, note: u8) {
@@ -134,13 +138,8 @@ impl Instrument for Synth {
         }
     }
 
-    // CORRECT
-    // fn process(&mut self, out: &mut [f32]) {
-    //     for s in out.iter_mut() { *s = self.next_sample(); }
-    // }
-
-    fn process(&mut self) -> f32 {
-        self.next_sample()
+    fn process(&mut self, out: &mut [f32]) {
+        for s in out.iter_mut() { *s = self.next_sample(); }
     }
 
     fn set_param(&mut self, id: u32, value: f32) {
@@ -194,11 +193,12 @@ impl Voice {
     fn is_releasing(&self) -> bool { self.amp_env.is_releasing() }
 }
 
-struct Track {
+pub struct Track {
     instrument: Box<dyn Instrument>,
     gain: f32,
     pan: f32,
     buffer: Vec<f32>,
+    effects: Vec<Box<dyn Processor + Send>>,
 }
 
 impl Track {
@@ -207,7 +207,8 @@ impl Track {
             instrument,
             gain: 0.0,
             pan: 0.0,
-            buffer: Vec::new(),
+            buffer: vec![0.0; BLOCK_SIZE],
+            effects: Vec::new(),
         }
     }
 
@@ -237,12 +238,22 @@ impl Engine {
         }
     }
 
-    pub fn process(&mut self) -> f32 {
-        let mut out = 0.0;
+    pub fn process(&mut self, left: &mut [f32], right: &mut[f32]) {
+        left.fill(0.0);
+        right.fill(0.0);
         for track in self.tracks.iter_mut() {
-            out += track.instrument.process();
+            let buf = &mut track.buffer[..left.len()];
+            track.instrument.process(buf);
+            // for fx in &mut t.effects { fx.process(buf); }
+
+            // Linear pan law
+            let (gain_l, gain_r) = (track.pan, 1. - track.pan);
+
+            for i in 0..left.len() {
+                left[i] += buf[i] * gain_l;
+                right[i] += buf[i] * gain_r;
+            }
         }
-        out
     }
 
     pub fn handle_event(&mut self, cmd: EngineCommand) {
@@ -255,7 +266,7 @@ impl Engine {
             EngineCommand::AddTrack(t) => self.tracks.push(*t),
             EngineCommand::RemoveTrack(id) => {
                 let t = self.tracks.swap_remove(id as usize);
-                let _ = self.garbage_tx.send(t);    // freed on the UI thread
+                let _ = self.garbage_tx.send(t);
             }
         }
     }
@@ -282,6 +293,9 @@ impl AudioEngine {
 
         let mut engine = Engine::new(garbage_tx);
 
+        let mut left = vec![0.0f32; BLOCK_SIZE];
+        let mut right = vec![0.0f32; BLOCK_SIZE];
+
         let stream = device
             .build_output_stream(
                 &config.into(),
@@ -290,8 +304,22 @@ impl AudioEngine {
                         engine.handle_event(cmd);
                     }
 
-                    for frame in data.chunks_mut(channels) {
-                        frame.fill(engine.process().clamp(-1.0, 1.0));
+                    for chunk in data.chunks_mut(BLOCK_SIZE * channels) {
+                        let frames = chunk.len() / channels;
+                        let (l, r) = (&mut left[..frames], &mut right[..frames]);
+
+                        engine.process(l, r);
+
+                        for (i, frame) in chunk.chunks_mut(channels).enumerate() {
+                            match channels {
+                                1 => frame[0] = 0.5 * (l[i] + r[i]),
+                                _ => {
+                                    frame[0] = l[i].clamp(-1.0, 1.0);
+                                    frame[1] = r[i].clamp(-1.0, 1.0);
+                                    for extra in &mut frame[2..] { *extra = 0.0; }
+                                },
+                            }
+                        }
                     }
                 },
                 |err| eprintln!("stream error: {err}"),
@@ -320,13 +348,13 @@ fn main() {
 
     engine.send(EngineCommand::Note{track: 0, event: NoteEvent::NoteOn { note: 60 }});
     engine.send(EngineCommand::Note{track: 0, event: NoteEvent::NoteOn { note: 64 }});
-    // engine.send(EngineCommand::Note{track: 0, event: NoteEvent::NoteOn { note: 67 }});
+    engine.send(EngineCommand::Note{track: 0, event: NoteEvent::NoteOn { note: 67 }});
 
-    thread::sleep(Duration::from_secs(4));
+    thread::sleep(Duration::from_millis(500));
 
     engine.send(EngineCommand::Note{track: 0, event: NoteEvent::NoteOff { note: 60 }});
     engine.send(EngineCommand::Note{track: 0, event: NoteEvent::NoteOff { note: 64 }});
-    // engine.send(EngineCommand::Note{track: 0, event: NoteEvent::NoteOff { note: 67 }});
+    engine.send(EngineCommand::Note{track: 0, event: NoteEvent::NoteOff { note: 67 }});
 
-    thread::sleep(Duration::from_secs(3));
+    thread::sleep(Duration::from_millis(500));
 }
