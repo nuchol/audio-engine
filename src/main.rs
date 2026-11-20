@@ -1,4 +1,4 @@
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{ self, Receiver, Sender };
 use std::thread;
 use std::time::Duration;
 
@@ -6,216 +6,16 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 mod oscillator;
 mod adsr;
-use crate::adsr::{ Adsr, AdsrSettings };
-use crate::oscillator::{Oscillator, Waveform};
+mod track;
+mod synth;
+mod processors;
 
-const MAX_TRACKS: usize = 16;
+use crate::track::Track;
+use crate::synth::{ Synth, Params };
+use crate::processors::NoteEvent;
+
 const BLOCK_SIZE: usize = 16;
-
-pub enum NoteEvent {
-    NoteOn { note: u8 },
-    NoteOff { note: u8 },
-}
-
-pub trait Instrument: Send {
-    fn handle_event(&mut self, event: NoteEvent);
-    fn set_param(&mut self, id: u32, value: f32);
-    fn process(&mut self, out: &mut [f32]);
-}
-
-pub trait Processor {
-    fn process(&mut self, out: &mut [f32]);
-}
-
-struct Params {
-    // filter
-    cutoff: f32,
-    resonance: f32,
-    filter_env_amount: f32,
-    lfo_to_cutoff: f32,
-
-    // envelopes (settings only)
-    amp_env: AdsrSettings,
-    flt_env: AdsrSettings,
-
-    // oscillator
-    waveform: Waveform,
-    detune: f32,
-
-    master_gain: f32,
-}
-
-impl Default for Params {
-    fn default() -> Self {
-        Self {
-            // filter
-            cutoff: 2000.0,
-            resonance: 0.2,
-            filter_env_amount: 2.0,
-            lfo_to_cutoff: 0.0,
-
-            // envelopes (settings only)
-            amp_env: AdsrSettings::new(0.01, 0.2, 0.8, 0.3),
-            flt_env: AdsrSettings::new(0.01, 0.2, 0.8, 0.3),
-
-            // oscillator
-            waveform: Waveform::Saw,
-            detune: 0.0,
-
-            master_gain: 0.25,
-        }
-    }
-}
-
-struct Synth {
-    voices: Vec<Voice>,
-    params: Params,
-    sample_rate: f32,
-
-    voice_age: u32,
-}
-
-impl Synth {
-    pub fn new(num_voices: u8, params: Params, sample_rate: f32) -> Self {
-        Self {
-            voices: (0..num_voices)
-                .map(|_| Voice::new(params.waveform, sample_rate))
-                .collect(),
-            params,
-            sample_rate,
-
-            voice_age: 0,
-        }
-    }
-
-    pub fn next_sample(&mut self) -> f32 {
-        let mut mix = 0.0;
-        for v in self.voices.iter_mut() {
-            if !v.is_idle() {
-                mix += v.next_sample(0.0, &self.params, self.sample_rate);
-            }
-        }
-
-        mix * self.params.master_gain
-    }
-
-    fn note_on(&mut self, note: u8) {
-        self.voice_age += 1;
-        let idx = self.find_voice(note);
-        let v = &mut self.voices[idx];
-        v.note = note;
-        v.age = self.voice_age;
-        v.start(note);
-    }
-
-    fn note_off(&mut self, note: u8) {
-        for v in &mut self.voices {
-            if v.note == note && !v.is_idle() && !v.is_releasing() {
-                v.release();
-            }
-        }
-    }
-
-    fn find_voice(&self, note: u8) -> usize {
-        let vs = &self.voices;
-        if let Some(i) = vs.iter().position(|v| v.note == note && !v.is_idle()) { return i; }
-        if let Some(i) = vs.iter().position(|v| v.is_idle()) { return i; }
-        if let Some((i, _)) = vs.iter().enumerate()
-            .filter(|(_, v)| v.is_releasing())
-            .min_by_key(|(_, v)| v.age) { return i; }
-        vs.iter().enumerate()
-            .min_by_key(|(_, v)| v.age)
-            .map(|(i, _)| i)
-            .expect("synth has no voices")   // only fails if num_voices == 0
-    }
-}
-
-impl Instrument for Synth {
-    fn handle_event(&mut self, event: NoteEvent) {
-        match event {
-            NoteEvent::NoteOn { note } => self.note_on(note),
-            NoteEvent::NoteOff { note } => self.note_off(note),
-        }
-    }
-
-    fn process(&mut self, out: &mut [f32]) {
-        for s in out.iter_mut() { *s = self.next_sample(); }
-    }
-
-    fn set_param(&mut self, id: u32, value: f32) {
-        
-    }
-}
-
-struct Voice {
-    osc: Oscillator,
-    freq: f32,
-    amp_env: Adsr,
-    filter_env: Adsr,
-    note: u8,
-
-    age: u32,
-}
-
-impl Voice {
-    pub fn new(waveform: Waveform, sample_rate: f32) -> Self {
-        Self {
-            osc: Oscillator::new(waveform, sample_rate),
-            freq: 0.0,
-            amp_env: Adsr::new(),
-            filter_env: Adsr::new(),
-            note: 0,
-            age: 0,
-        }
-    }
-
-    pub fn next_sample(&mut self, lfo: f32, p: &Params, sample_rate: f32) -> f32 {
-        let mut sample = self.osc.next_sample();
-        let amp = self.amp_env.next(&p.amp_env, sample_rate);
-        sample *= amp;
-        sample
-    }
-
-    fn start(&mut self, note: u8) {
-        self.freq = 440.0 * 2_f32.powf((note as f32 - 69.0) / 12.0);
-        self.osc.set_freq(self.freq);
-
-        self.amp_env.note_on();
-        self.filter_env.note_on();
-    }
-
-    fn release(&mut self) {
-        self.amp_env.note_off();
-        self.filter_env.note_off();
-    }
-
-    fn is_idle(&self) -> bool { self.amp_env.is_idle() }
-    fn is_releasing(&self) -> bool { self.amp_env.is_releasing() }
-}
-
-pub struct Track {
-    instrument: Box<dyn Instrument>,
-    gain: f32,
-    pan: f32,
-    buffer: Vec<f32>,
-    effects: Vec<Box<dyn Processor + Send>>,
-}
-
-impl Track {
-    pub fn new(instrument: Box<dyn Instrument>) -> Self {
-        Self {
-            instrument,
-            gain: 0.0,
-            pan: 0.0,
-            buffer: vec![0.0; BLOCK_SIZE],
-            effects: Vec::new(),
-        }
-    }
-
-    pub fn handle_event(&mut self, event: NoteEvent) {
-        self.instrument.handle_event(event);
-    }
-}
+const MAX_TRACKS: usize = 16;
 
 pub enum EngineCommand {
     Note { track: u32, event: NoteEvent },
@@ -225,33 +25,74 @@ pub enum EngineCommand {
     RemoveTrack(u32),
 }
 
-struct Engine {
+// Lives on the autio thread
+struct AudioTread {
     tracks: Vec<Track>,
     garbage_tx: Sender<Track>,
+    block_size: usize,
+
+    l_data: Vec<f32>,
+    r_data: Vec<f32>,
 }
 
-impl Engine {
-    pub fn new(garbage_tx: Sender<Track>) -> Self {
+impl AudioTread {
+    pub fn new(garbage_tx: Sender<Track>, block_size: usize) -> Self {
         Self {
             tracks: Vec::with_capacity(MAX_TRACKS),
             garbage_tx,
+            block_size,
+
+            l_data: vec![0.0f32; block_size],
+            r_data: vec![0.0f32; block_size],
+        }
+    }
+    
+    pub fn process_loop(
+        &mut self,
+        data: &mut [f32],
+        channels: usize,
+        cmd_rx: &Receiver<EngineCommand>,
+    ) {
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            self.handle_event(cmd);
+        }
+
+        for chunk in data.chunks_mut(self.block_size * channels) {
+            let frames = chunk.len() / channels;
+            self.process_tracks();
+
+            let (l, r) = (&mut self.l_data[..frames], &mut self.r_data[..frames]);
+
+            for (i, frame) in chunk.chunks_mut(channels).enumerate() {
+                match channels {
+                    1 => frame[0] = 0.5 * (l[i] + r[i]),
+                    _ => {
+                        frame[0] = l[i].clamp(-1.0, 1.0);
+                        frame[1] = r[i].clamp(-1.0, 1.0);
+                        for extra in &mut frame[2..] { *extra = 0.0; }
+                    },
+                }
+            }
         }
     }
 
-    pub fn process(&mut self, left: &mut [f32], right: &mut[f32]) {
-        left.fill(0.0);
-        right.fill(0.0);
+    fn process_tracks(&mut self) {
+        self.l_data.fill(0.0);
+        self.r_data.fill(0.0);
+
+        let n = self.l_data.len();
+
         for track in self.tracks.iter_mut() {
-            let buf = &mut track.buffer[..left.len()];
+            let buf = &mut track.buffer[..n];
             track.instrument.process(buf);
             // for fx in &mut t.effects { fx.process(buf); }
 
             // Linear pan law
             let (gain_l, gain_r) = (track.pan, 1. - track.pan);
 
-            for i in 0..left.len() {
-                left[i] += buf[i] * gain_l;
-                right[i] += buf[i] * gain_r;
+            for i in 0..n {
+                self.l_data[i] += buf[i] * gain_l;
+                self.r_data[i] += buf[i] * gain_r;
             }
         }
     }
@@ -281,7 +122,7 @@ struct AudioEngine {
 }
 
 impl AudioEngine {
-    pub fn new() -> Self {
+    pub fn new(block_size: usize) -> Self {
         let host = cpal::default_host();
         let device = host.default_output_device().expect("no output device");
         let config = device.default_output_config().expect("no default config");
@@ -291,36 +132,13 @@ impl AudioEngine {
         let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCommand>();
         let (garbage_tx, garbage_rx) = mpsc::channel::<Track>();
 
-        let mut engine = Engine::new(garbage_tx);
-
-        let mut left = vec![0.0f32; BLOCK_SIZE];
-        let mut right = vec![0.0f32; BLOCK_SIZE];
+        let mut process_thread = AudioTread::new(garbage_tx, block_size);
 
         let stream = device
             .build_output_stream(
                 &config.into(),
                 move |data: &mut [f32], _| {
-                    while let Ok(cmd) = cmd_rx.try_recv() {
-                        engine.handle_event(cmd);
-                    }
-
-                    for chunk in data.chunks_mut(BLOCK_SIZE * channels) {
-                        let frames = chunk.len() / channels;
-                        let (l, r) = (&mut left[..frames], &mut right[..frames]);
-
-                        engine.process(l, r);
-
-                        for (i, frame) in chunk.chunks_mut(channels).enumerate() {
-                            match channels {
-                                1 => frame[0] = 0.5 * (l[i] + r[i]),
-                                _ => {
-                                    frame[0] = l[i].clamp(-1.0, 1.0);
-                                    frame[1] = r[i].clamp(-1.0, 1.0);
-                                    for extra in &mut frame[2..] { *extra = 0.0; }
-                                },
-                            }
-                        }
-                    }
+                    process_thread.process_loop(data, channels, &cmd_rx);
                 },
                 |err| eprintln!("stream error: {err}"),
                 None,
@@ -341,9 +159,10 @@ impl AudioEngine {
 }
 
 fn main() {
-    let engine = AudioEngine::new();
-    let mut instrument = Synth::new(8, Params::default(), engine.sample_rate);
-    let mut track = Track::new(Box::new(instrument));
+    let engine = AudioEngine::new(BLOCK_SIZE);
+    let instrument = Synth::new(8, Params::default(), engine.sample_rate);
+    let track = Track::new(Box::new(instrument), BLOCK_SIZE);
+
     engine.send(EngineCommand::AddTrack(Box::new(track)));
 
     engine.send(EngineCommand::Note{track: 0, event: NoteEvent::NoteOn { note: 60 }});
